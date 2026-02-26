@@ -26,7 +26,6 @@ jobs:
           --health-retries 30
 
     env:
-      # Postgres-only (CANON)
       DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
       SYNC_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
       ASYNC_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/efhc_test
@@ -67,16 +66,16 @@ jobs:
           print("OK: Postgres-only profile")
           PY
 
-      - name: Ensure project.zip exists in repo root
+      - name: Ensure efhc.zip exists in repo root
         run: |
-          test -f project.zip || (echo "ERROR: project.zip not found in repo root" && exit 1)
-          ls -la project.zip
+          test -f efhc.zip || (echo "ERROR: efhc.zip not found in repo root" && exit 1)
+          ls -la efhc.zip
 
-      - name: Unzip project.zip
+      - name: Unzip efhc.zip
         run: |
           rm -rf extracted
           mkdir -p extracted
-          unzip -q project.zip -d extracted
+          unzip -q efhc.zip -d extracted
           find extracted -maxdepth 12 -name ".npmrc" -print -delete || true
 
       - name: Backend deps
