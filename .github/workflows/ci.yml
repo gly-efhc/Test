@@ -1,0 +1,114 @@
+name: canon
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  canon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: efhc_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d efhc_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+
+    env:
+      # Postgres-only (CANON)
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      SYNC_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      ASYNC_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/efhc_test
+
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Debug repo root listing
+        run: |
+          echo "REF=$GITHUB_REF"
+          echo "SHA=$GITHUB_SHA"
+          pwd
+          ls -la
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Guard DB profile (Postgres-only)
+        run: |
+          python - <<'PY'
+          import os, sys
+          url = os.environ.get("DATABASE_URL")
+          print("DATABASE_URL present:", bool(url), "len:", 0 if url is None else len(url))
+          if not url:
+            print("ERROR: DATABASE_URL is empty")
+            sys.exit(2)
+          if url.lower().startswith("sqlite://"):
+            print("ERROR: SQLite is forbidden by CANON")
+            sys.exit(3)
+          print("OK: Postgres-only profile")
+          PY
+
+      - name: Ensure project.zip exists in repo root
+        run: |
+          test -f project.zip || (echo "ERROR: project.zip not found in repo root" && exit 1)
+          ls -la project.zip
+
+      - name: Unzip project.zip
+        run: |
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q project.zip -d extracted
+          find extracted -maxdepth 12 -name ".npmrc" -print -delete || true
+
+      - name: Backend deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r extracted/backend/requirements.txt
+          pip install -U pytest pytest-asyncio alembic "psycopg[binary]" PyJWT
+
+      - name: compileall (backend)
+        run: |
+          python -m compileall extracted/backend -q
+
+      - name: Alembic upgrade head (Postgres-only)
+        run: |
+          cd extracted/backend
+          alembic -c alembic.ini upgrade head
+
+      - name: pytest -q (Postgres-only)
+        run: |
+          cd extracted
+          pytest -q
+
+      - name: Frontend lockfile checks + build
+        run: |
+          set -e
+          test -f extracted/frontend/package-lock.json || (echo "ERROR: package-lock.json missing" && exit 1)
+
+          if grep -RInE "applied-caas-gateway|internal\.api\.openai|artifactory" extracted/frontend/package-lock.json; then
+            echo "ERROR: forbidden registry markers in package-lock.json"
+            exit 1
+          fi
+
+          cd extracted/frontend
+          npm ci
+          npm run build
