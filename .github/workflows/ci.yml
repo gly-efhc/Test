@@ -5,6 +5,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
 jobs:
   canon:
     runs-on: ubuntu-latest
@@ -97,8 +101,10 @@ jobs:
             -print -delete || true
           test -d extracted/backend || \
             (echo "ERROR: extracted/backend missing" && exit 1)
+          test -f extracted/backend/alembic.ini || exit 1
+          test -f extracted/backend/requirements.txt || exit 1
 
-      - name: Backend deps
+      - name: Install backend deps
         run: |
           python -m pip install --upgrade pip
           pip install -r extracted/backend/requirements.txt
@@ -115,8 +121,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client
+          psql --version | tee ci_artifacts/06_psql_version.txt
 
-      - name: PSQL diag (pre)
+      - name: PSQL diag pre
         run: |
           PGPASSWORD=postgres psql \
             -h localhost -p 5432 -U postgres -d efhc_test \
@@ -125,18 +132,17 @@ jobs:
             -c "SHOW search_path;" \
             -c "SELECT nspname FROM pg_namespace ORDER BY 1;" \
             -c "SELECT count(*) AS tables FROM pg_tables;" \
-            | tee ci_artifacts/06_psql_pre.txt
+            | tee ci_artifacts/07_psql_pre.txt
 
       - name: Alembic upgrade head
         run: |
-          set -o pipefail
           cd extracted/backend
           python -m alembic -c alembic.ini upgrade head \
-            2>&1 | tee ../../ci_artifacts/07_alembic_upgrade.txt
+            2>&1 | tee ../../ci_artifacts/08_alembic_upgrade.txt
 
       - name: Sanity required tables
         run: |
-          python - <<'PY' | tee ci_artifacts/08_sanity.txt
+          python - <<'PY' | tee ci_artifacts/09_sanity.txt
           import os, sys
           import psycopg
 
@@ -159,6 +165,7 @@ jobs:
                   print("db=", cur.fetchone()[0])
                   cur.execute("SHOW search_path")
                   print("search_path=", cur.fetchone()[0])
+
                   for name in req:
                       if not ok(cur, name):
                           missing.append(name)
@@ -180,7 +187,7 @@ jobs:
           print("OK: required tables exist")
           PY
 
-      - name: PSQL diag (post)
+      - name: PSQL diag post
         if: always()
         run: |
           PGPASSWORD=postgres psql \
@@ -192,12 +199,12 @@ jobs:
                 ORDER BY 1,2;" \
             -c "SELECT to_regclass('efhc_core.users') AS core_users,
                        to_regclass('public.users') AS pub_users;" \
-            | tee ci_artifacts/09_psql_post.txt
+            | tee ci_artifacts/10_psql_post.txt
 
-      - name: pg_dump schemas (on failure)
+      - name: pg_dump schemas (only on failure)
         if: failure()
         run: |
-          out="ci_artifacts/10_pg_dump_schemas.sql"
+          out="ci_artifacts/11_pg_dump_schemas.sql"
           PGPASSWORD=postgres pg_dump \
             -h localhost -p 5432 -U postgres -d efhc_test \
             --schema-only \
@@ -212,15 +219,13 @@ jobs:
       - name: pytest -q
         if: always()
         run: |
-          set -o pipefail
           cd extracted
           PYTHONPATH=backend pytest -q \
-            2>&1 | tee ../ci_artifacts/11_pytest.txt
+            2>&1 | tee ../ci_artifacts/12_pytest.txt
 
       - name: Frontend build
         if: always()
         run: |
-          set -e
           test -f extracted/frontend/package-lock.json || exit 1
           if grep -RInE \
             "applied-caas-gateway|internal\.api\.openai|artifactory" \
@@ -229,8 +234,8 @@ jobs:
             exit 1
           fi
           cd extracted/frontend
-          npm ci 2>&1 | tee ../../ci_artifacts/12_npm_ci.txt
-          npm run build 2>&1 | tee ../../ci_artifacts/13_npm_build.txt
+          npm ci 2>&1 | tee ../../ci_artifacts/13_npm_ci.txt
+          npm run build 2>&1 | tee ../../ci_artifacts/14_npm_build.txt
 
       - name: Upload artifacts
         if: always()
