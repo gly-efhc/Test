@@ -8,7 +8,7 @@ on:
 jobs:
   canon:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
 
     services:
       postgres:
@@ -26,26 +26,38 @@ jobs:
           --health-retries 30
 
     env:
-      # SQLAlchemy URLs
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
-      SYNC_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
-      ASYNC_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/efhc_test
+      DB_SCHEMA_CORE: efhc_core
+      DB_SCHEMA_ADMIN: efhc_admin
 
-      # Psycopg-native URL for sanity checks (psycopg.connect)
+      DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      SYNC_DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      ASYNC_DATABASE_URL: >-
+        postgresql+asyncpg://postgres:postgres@localhost:5432/efhc_test
+
       PSYCOPG_URL: postgresql://postgres:postgres@localhost:5432/efhc_test
 
+      PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PIP_NO_PYTHON_VERSION_WARNING: "1"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Debug repo root listing
+      - name: Create artifacts dir
         run: |
-          echo "REF=$GITHUB_REF"
-          echo "SHA=$GITHUB_SHA"
-          pwd
-          ls -la
+          rm -rf ci_artifacts
+          mkdir -p ci_artifacts
+
+      - name: Debug repo root
+        run: |
+          {
+            echo "REF=$GITHUB_REF"
+            echo "SHA=$GITHUB_SHA"
+            echo "PWD=$(pwd)"
+            ls -la
+          } | tee ci_artifacts/00_repo_root.txt
 
       - uses: actions/setup-python@v5
         with:
@@ -55,24 +67,38 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Versions (python/pip/node/npm)
+        run: |
+          {
+            python -V
+            python -m pip -V
+            node -v
+            npm -v
+          } | tee ci_artifacts/01_versions.txt
+
       - name: Guard DB profile (Postgres-only)
         run: |
-          python - <<'PY'
+          python - <<'PY' | tee ci_artifacts/02_db_profile_guard.txt
           import os, sys
-          url = os.environ.get("DATABASE_URL")
+          url = os.environ.get("DATABASE_URL", "")
           if not url:
               print("ERROR: DATABASE_URL is empty")
               sys.exit(2)
-          if url.lower().startswith("sqlite://"):
+          low = url.lower()
+          if low.startswith("sqlite://"):
               print("ERROR: SQLite is forbidden by CANON")
               sys.exit(3)
           print("OK: Postgres-only profile")
+          print("DATABASE_URL(masked)=", low.split("@")[0] + "@***")
+          purl = os.environ.get("PSYCOPG_URL", "")
+          print("PSYCOPG_URL(masked)=", purl.split("@")[0] + "@***")
           PY
 
-      - name: Ensure efhc.zip exists in repo root
+      - name: Ensure efhc.zip exists
         run: |
-          test -f efhc.zip || (echo "ERROR: efhc.zip not found in repo root" && exit 1)
-          ls -la efhc.zip
+          test -f efhc.zip || \
+            (echo "ERROR: efhc.zip not found in repo root" && exit 1)
+          ls -la efhc.zip | tee ci_artifacts/03_efhc_zip_ls.txt
 
       - name: Unzip efhc.zip
         run: |
@@ -81,31 +107,97 @@ jobs:
           unzip -q efhc.zip -d extracted
           find extracted -maxdepth 12 -name ".npmrc" -print -delete || true
 
-      - name: Debug extracted listing
+      - name: Debug extracted tree
         run: |
-          ls -la extracted | sed -n '1,200p'
-          test -f extracted/backend/alembic.ini || (echo "ERROR: extracted/backend/alembic.ini missing" && exit 1)
-          test -f extracted/backend/requirements.txt || (echo "ERROR: extracted/backend/requirements.txt missing" && exit 1)
+          {
+            ls -la extracted
+            echo "--- backend ---"
+            ls -la extracted/backend | sed -n '1,200p'
+            echo "--- frontend ---"
+            ls -la extracted/frontend | sed -n '1,200p' || true
+          } | tee ci_artifacts/04_extracted_ls.txt
 
-      - name: Backend deps
+      - name: Quick file checks
+        run: |
+          test -f extracted/backend/alembic.ini || \
+            (echo "ERROR: extracted/backend/alembic.ini missing" && exit 1)
+          test -f extracted/backend/requirements.txt || \
+            (echo "ERROR: extracted/backend/requirements.txt missing" && exit 1)
+          echo "OK: files exist" | tee ci_artifacts/05_file_checks.txt
+
+      - name: Install backend deps
         run: |
           python -m pip install --upgrade pip
           pip install -r extracted/backend/requirements.txt
-          # IMPORTANT: no -U (no drifting pytest stack)
-          pip install pytest pytest-asyncio alembic "psycopg[binary]" PyJWT
+          pip install pytest pytest-asyncio "psycopg[binary]" alembic PyJWT
+          pip freeze | sort | tee ci_artifacts/06_pip_freeze.txt
 
       - name: compileall (backend)
         run: |
-          python -m compileall extracted/backend -q
+          python -m compileall extracted/backend -q \
+            | tee ci_artifacts/07_compileall.txt
 
-      - name: Alembic upgrade head (Postgres-only)
+      - name: Install psql client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Postgres diagnostics (pre-alembic)
+        run: |
+          {
+            echo "PSQL VERSION:"
+            psql --version
+            echo
+            PGPASSWORD=postgres psql \
+              -h localhost -p 5432 -U postgres -d efhc_test \
+              -v ON_ERROR_STOP=1 \
+              -c "SELECT current_database() AS db;" \
+              -c "SHOW search_path;" \
+              -c "SELECT current_user;" \
+              -c "SELECT nspname FROM pg_namespace ORDER BY 1;" \
+              -c "SELECT schemaname, tablename FROM pg_tables ORDER BY 1,2;" \
+              -c "SELECT to_regclass('efhc_core.users') AS core_users,
+                         to_regclass('public.users') AS pub_users;"
+          } | tee ci_artifacts/08_psql_pre_alembic.txt
+
+      - name: Alembic diagnostics (pre)
         run: |
           cd extracted/backend
-          alembic -c alembic.ini upgrade head
+          {
+            python -m alembic --version
+            python -m alembic -c alembic.ini current || true
+            python -m alembic -c alembic.ini heads || true
+            python -m alembic -c alembic.ini history -v || true
+          } | tee ../../ci_artifacts/09_alembic_diag_pre.txt
+
+      - name: Alembic upgrade head (online)
+        run: |
+          cd extracted/backend
+          python -m alembic -c alembic.ini upgrade head \
+            | tee ../../ci_artifacts/10_alembic_upgrade_online.txt
+
+      - name: Postgres diagnostics (post-alembic)
+        if: always()
+        run: |
+          {
+            PGPASSWORD=postgres psql \
+              -h localhost -p 5432 -U postgres -d efhc_test \
+              -v ON_ERROR_STOP=1 \
+              -c "SELECT current_database() AS db;" \
+              -c "SHOW search_path;" \
+              -c "SELECT nspname FROM pg_namespace ORDER BY 1;" \
+              -c "SELECT schemaname, tablename FROM pg_tables ORDER BY 1,2;" \
+              -c "SELECT to_regclass('efhc_core.users') AS core_users,
+                         to_regclass('public.users') AS pub_users;" \
+              -c "SELECT to_regclass('efhc_core.withdraw_requests') AS core_wr,
+                         to_regclass('public.withdraw_requests') AS pub_wr;" \
+              -c "SELECT to_regclass('efhc_admin.efhc_sale_packages') AS admin_sp,
+                         to_regclass('public.efhc_sale_packages') AS pub_sp;"
+          } | tee ci_artifacts/11_psql_post_alembic.txt
 
       - name: Sanity DB objects after alembic (core/admin)
         run: |
-          python - <<'PY'
+          python - <<'PY' | tee ci_artifacts/12_sanity_to_regclass.txt
           import os, sys
           import psycopg
 
@@ -116,38 +208,93 @@ jobs:
               "efhc_admin.efhc_sale_packages",
           ]
 
+          def check(cur, name: str) -> bool:
+              cur.execute("SELECT to_regclass(%s)", (name,))
+              return cur.fetchone()[0] is not None
+
           missing = []
+          hints = []
           with psycopg.connect(url) as conn:
               with conn.cursor() as cur:
+                  cur.execute("SELECT current_database()")
+                  print("db=", cur.fetchone()[0])
+                  cur.execute("SHOW search_path")
+                  print("search_path=", cur.fetchone()[0])
+
                   for name in required:
-                      cur.execute("SELECT to_regclass(%s)", (name,))
-                      if cur.fetchone()[0] is None:
+                      if not check(cur, name):
                           missing.append(name)
+                          t = name.split(".", 1)[1]
+                          pub = f"public.{t}"
+                          if check(cur, pub):
+                              hints.append(f"{name} exists as {pub}")
 
           if missing:
               print("ERROR: required tables missing after alembic:")
               for t in missing:
                   print(" -", t)
+              if hints:
+                  print("HINTS:")
+                  for h in hints:
+                      print(" -", h)
               sys.exit(2)
 
           print("OK: required tables exist after alembic")
           PY
 
-      - name: pytest -q (Postgres-only)
+      - name: Alembic offline SQL (signal only)
+        if: always()
         run: |
-          cd extracted
-          pytest -q
+          cd extracted/backend
+          python -m alembic -c alembic.ini upgrade head --sql \
+            | tee ../../ci_artifacts/13_alembic_offline_sql.txt || true
 
-      - name: Frontend lockfile checks + build
+      - name: pg_dump schemas (post-alembic)
+        if: always()
         run: |
           set -e
-          test -f extracted/frontend/package-lock.json || (echo "ERROR: package-lock.json missing" && exit 1)
+          out="ci_artifacts/17_pg_dump_schemas.sql"
+          PGPASSWORD=postgres pg_dump \
+            -h localhost -p 5432 -U postgres -d efhc_test \
+            --schema-only \
+            --schema=efhc_core \
+            --schema=efhc_admin \
+            --schema=public \
+            --no-owner \
+            --no-privileges \
+            > "$out"
+          gzip -f "$out"
+          ls -la ci_artifacts/17_pg_dump_schemas.sql.gz
 
-          if grep -RInE "applied-caas-gateway|internal\.api\.openai|artifactory" extracted/frontend/package-lock.json; then
+      - name: pytest -q
+        if: always()
+        run: |
+          cd extracted
+          PYTHONPATH=backend pytest -q \
+            | tee ../ci_artifacts/14_pytest.txt
+
+      - name: Frontend lockfile checks + build
+        if: always()
+        run: |
+          set -e
+          test -f extracted/frontend/package-lock.json || \
+            (echo "ERROR: package-lock.json missing" && exit 1)
+
+          if grep -RInE \
+            "applied-caas-gateway|internal\.api\.openai|artifactory" \
+            extracted/frontend/package-lock.json; then
             echo "ERROR: forbidden registry markers in package-lock.json"
             exit 1
           fi
 
           cd extracted/frontend
-          npm ci
-          npm run build
+          npm ci | tee ../../ci_artifacts/15_npm_ci.txt
+          npm run build | tee ../../ci_artifacts/16_npm_build.txt
+
+      - name: Upload CI artifacts (logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci_artifacts
+          path: ci_artifacts
+          retention-days: 14
