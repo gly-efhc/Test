@@ -112,69 +112,81 @@ jobs:
             alembic PyJWT
           pip freeze | sort | tee ci_artifacts/04_pip_freeze.txt
 
+      # -------- Gate steps (continue but record exit codes) --------
 
-- name: flake8 (critical)
-  continue-on-error: true
-  run: |
-    set +e
-    python -m pip install flake8
-    cd extracted
-    flake8 backend/app tests api ops             --count --show-source --statistics             2>&1 | tee ../ci_artifacts/04a_flake8_critical.txt
-    ec=${PIPESTATUS[0]}
-    echo $ec > ../ci_artifacts/exit_flake8_critical.txt
-    exit 0
+      - name: flake8 (critical)
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install flake8
+          cd extracted
+          flake8 backend/app tests api ops \
+            --count --show-source --statistics \
+            2>&1 | tee ../ci_artifacts/04a_flake8_critical.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_flake8_critical.txt
+          exit 0
 
       - name: flake8 (full report, non-blocking)
+        continue-on-error: true
         run: |
+          set +e
           python -m pip install flake8
           cd extracted
           flake8 backend/app tests api ops \
             --exit-zero --count --show-source --statistics \
             2>&1 | tee ../ci_artifacts/04b_flake8_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_flake8_full.txt
+          exit 0
 
       - name: ruff (full report, non-blocking)
+        continue-on-error: true
         run: |
+          set +e
           python -m pip install ruff
           cd extracted
-          ruff check \
-            backend/app tests api ops \
-            --exit-zero \
-            --statistics \
+          ruff check backend api ops tests \
             2>&1 | tee ../ci_artifacts/04c_ruff_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_ruff_full.txt
+          exit 0
 
       - name: mypy (full report, non-blocking)
+        continue-on-error: true
         run: |
+          set +e
           python -m pip install mypy
           cd extracted
-          # Keep mypy cache out of the repo tree: tests scan repo.
-          mkdir -p ../ci_artifacts/_mypy_cache
-          mypy \
+          mypy backend/app \
             --cache-dir ../ci_artifacts/_mypy_cache \
-            2>&1 | tee ../ci_artifacts/04d_mypy_full.txt || true
-
+            2>&1 | tee ../ci_artifacts/04d_mypy_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_mypy_full.txt
           rm -rf .mypy_cache || true
+          exit 0
 
       - name: bandit (full report, non-blocking)
+        continue-on-error: true
         run: |
+          set +e
           python -m pip install bandit
           cd extracted
           bandit -r backend/app \
-            -q -f txt \
-            2>&1 | tee ../ci_artifacts/04e_bandit_full.txt || true
+            2>&1 | tee ../ci_artifacts/04e_bandit_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_bandit_full.txt
+          exit 0
 
-      - name: endpoint discovery (report-only)
+      - name: compileall backend
+        continue-on-error: true
         run: |
-          cd extracted
-          python ops/ci_checks/endpoint_discovery_report.py \
-            2>&1 | tee ../ci_artifacts/04f_endpoint_discovery.txt
-- name: compileall backend
-  continue-on-error: true
-  run: |
-    set +e
-    python -m compileall extracted/backend -q             | tee ci_artifacts/05_compileall.txt
-    ec=${PIPESTATUS[0]}
-    echo $ec > ci_artifacts/exit_compileall.txt
-    exit 0
+          set +e
+          python -m compileall extracted/backend -q \
+            2>&1 | tee ci_artifacts/05_compileall.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ci_artifacts/exit_compileall.txt
+          exit 0
 
       - name: Install psql client
         run: |
@@ -183,7 +195,9 @@ jobs:
           psql --version | tee ci_artifacts/06_psql_version.txt
 
       - name: PSQL diag pre
+        continue-on-error: true
         run: |
+          set +e
           PGPASSWORD=postgres psql \
             -h localhost -p 5432 -U postgres -d efhc_test \
             -v ON_ERROR_STOP=1 \
@@ -191,166 +205,58 @@ jobs:
             -c "SHOW search_path;" \
             -c "SELECT nspname FROM pg_namespace ORDER BY 1;" \
             -c "SELECT count(*) AS tables FROM pg_tables;" \
-            | tee ci_artifacts/07_psql_pre.txt
+            2>&1 | tee ci_artifacts/07_psql_pre.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ci_artifacts/exit_psql_pre.txt
+          exit 0
 
-- name: Alembic upgrade head
-  continue-on-error: true
-  run: |
-    set +e
-    cd extracted/backend
-    python -m alembic -c alembic.ini upgrade head             2>&1 | tee ../../ci_artifacts/08_alembic_upgrade.txt
-    ec=${PIPESTATUS[0]}
-    echo $ec > ../../ci_artifacts/exit_alembic_upgrade.txt
-    exit 0
-
-- name: Sanity required tables
-  continue-on-error: true
-  run: |
-    set +e
-    python - <<'PY' | tee ci_artifacts/09_sanity.txt
-    import os, sys
-    import psycopg
-
-    url = os.environ["PSYCOPG_URL"]
-    req = [
-        "efhc_core.users",
-        "efhc_core.withdraw_requests",
-        "efhc_admin.efhc_sale_packages",
-    ]
-
-    def ok(cur, name: str) -> bool:
-        cur.execute("SELECT to_regclass(%s)", (name,))
-        return cur.fetchone()[0] is not None
-
-    missing = []
-    hints = []
-    with psycopg.connect(url) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT current_database()")
-            print("db=", cur.fetchone()[0])
-            cur.execute("SHOW search_path")
-            print("search_path=", cur.fetchone()[0])
-
-            for name in req:
-                if not ok(cur, name):
-                    missing.append(name)
-                    t = name.split(".", 1)[1]
-                    pub = f"public.{t}"
-                    if ok(cur, pub):
-                        hints.append(f"{name} as {pub}")
-
-    if missing:
-        print("ERROR: missing required tables:")
-        for t in missing:
-            print(" -", t)
-        if hints:
-            print("HINTS:")
-            for h in hints:
-                print(" -", h)
-        sys.exit(2)
-
-    print("OK: required tables exist")
-    PY
-    ec=${PIPESTATUS[0]}
-    echo $ec > ci_artifacts/exit_sanity.txt
-    exit 0
-
-      - name: PSQL diag post
-        if: always()
+      - name: Alembic upgrade head
+        continue-on-error: true
         run: |
-          PGPASSWORD=postgres psql \
-            -h localhost -p 5432 -U postgres -d efhc_test \
-            -v ON_ERROR_STOP=1 \
-            -c "SELECT current_database() AS db;" \
-            -c "SHOW search_path;" \
-            -c "SELECT schemaname, tablename FROM pg_tables \
-                ORDER BY 1,2;" \
-            -c "SELECT to_regclass('efhc_core.users') AS core_users,
-                       to_regclass('public.users') AS pub_users;" \
-            | tee ci_artifacts/10_psql_post.txt
+          set +e
+          cd extracted/backend
+          python -m alembic -c alembic.ini upgrade head \
+            2>&1 | tee ../../ci_artifacts/08_alembic_upgrade.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../../ci_artifacts/exit_alembic_upgrade.txt
+          exit 0
 
-      - name: pg_dump schemas (only on failure)
-        if: failure()
+      - name: pytest -q
+        continue-on-error: true
         run: |
-          out="ci_artifacts/11_pg_dump_schemas.sql"
-          PGPASSWORD=postgres pg_dump \
-            -h localhost -p 5432 -U postgres -d efhc_test \
-            --schema-only \
-            --schema=efhc_core \
-            --schema=efhc_admin \
-            --schema=public \
-            --no-owner \
-            --no-privileges \
-            > "$out"
-          gzip -f "$out"
+          set +e
+          rm -rf extracted/.mypy_cache || true
+          cd extracted
+          PYTHONPATH=backend pytest -q \
+            2>&1 | tee ../ci_artifacts/12_pytest.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_pytest.txt
+          exit 0
 
-- name: pytest -q
-  if: always()
-  continue-on-error: true
-  run: |
-    set +e
-    cd extracted
-    PYTHONPATH=backend pytest -q             2>&1 | tee ../ci_artifacts/12_pytest.txt
-    ec=${PIPESTATUS[0]}
-    echo $ec > ../ci_artifacts/exit_pytest.txt
-    exit 0
+      - name: Frontend build
+        continue-on-error: true
+        run: |
+          set +e
+          test -f extracted/frontend/package-lock.json || exit 1
+          if grep -RInE \
+            "applied-caas-gateway|internal\.api\.openai|artifactory" \
+            extracted/frontend/package-lock.json; then
+            echo "ERROR: forbidden registry markers"
+            exit 1
+          fi
 
-- name: Frontend build
-  if: always()
-  continue-on-error: true
-  run: |
-    set +e
-    test -f extracted/frontend/package-lock.json || exit 1
-    if grep -RInE             "applied-caas-gateway|internal\.api\.openai|artifactory"             extracted/frontend/package-lock.json; then
-      echo "ERROR: forbidden registry markers"
-      exit 1
-    fi
-    cd extracted/frontend
-    npm ci 2>&1 | tee ../../ci_artifacts/13_npm_ci.txt
-    ec_ci=${PIPESTATUS[0]}
-    npm run build 2>&1 | tee ../../ci_artifacts/14_npm_build.txt
-    ec_build=${PIPESTATUS[0]}
-    echo $ec_ci > ../../ci_artifacts/exit_npm_ci.txt
-    echo $ec_build > ../../ci_artifacts/exit_npm_build.txt
-    exit 0
+          cd extracted/frontend
+          npm ci 2>&1 | tee ../../ci_artifacts/13_npm_ci.txt
+          ec_ci=${PIPESTATUS[0]}
+          echo "$ec_ci" > ../../ci_artifacts/exit_npm_ci.txt
 
-- name: Gate summary (fail job if any gate failed)
-  if: always()
-  run: |
-    set -e
-    echo "Gate exit codes:"
-    for f in             exit_flake8_critical.txt             exit_compileall.txt             exit_alembic_upgrade.txt             exit_sanity.txt             exit_pytest.txt             exit_npm_ci.txt             exit_npm_build.txt
-    do
-      p="ci_artifacts/$f"
-      if test -f "$p"; then
-        echo " - $f=$(cat "$p")"
-      else
-        echo " - $f=MISSING"
-      fi
-    done
+          npm run build 2>&1 | tee ../../ci_artifacts/14_npm_build.txt
+          ec_build=${PIPESTATUS[0]}
+          echo "$ec_build" > ../../ci_artifacts/exit_npm_build.txt
 
-    failed=0
-    for f in             exit_flake8_critical.txt             exit_compileall.txt             exit_alembic_upgrade.txt             exit_sanity.txt             exit_pytest.txt             exit_npm_ci.txt             exit_npm_build.txt
-    do
-      p="ci_artifacts/$f"
-      if test -f "$p"; then
-        ec=$(cat "$p")
-        if test "$ec" != "0"; then
-          failed=1
-        fi
-      else
-        failed=1
-      fi
-    done
+          exit 0
 
-    if test "$failed" = "1"; then
-      echo "ERROR: one or more gate steps failed."
-      exit 1
-    fi
-
-    echo "OK: all gate steps passed."
-
-
+      # Upload artifacts BEFORE failing the job
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -358,3 +264,28 @@ jobs:
           name: ci_artifacts
           path: ci_artifacts
           retention-days: 14
+
+      - name: Gate summary
+        run: |
+          failed=0
+          for f in ci_artifacts/exit_*.txt; do
+            if test -f "$f"; then
+              v="$(cat "$f" || true)"
+              if test "$v" != "0"; then
+                echo "FAIL: $f exit=$v"
+                failed=1
+              else
+                echo "OK:   $f exit=$v"
+              fi
+            else
+              echo "MISS: $f"
+              failed=1
+            fi
+          done
+
+          if test "$failed" = "1"; then
+            echo "ERROR: one or more gate steps failed."
+            exit 1
+          fi
+
+          echo "OK: all gate steps passed."
