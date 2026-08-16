@@ -1,0 +1,441 @@
+name: canon
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+jobs:
+  canon:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: efhc_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d efhc_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+
+    env:
+      DB_SCHEMA_CORE: efhc_core
+      DB_SCHEMA_ADMIN: efhc_admin
+
+      DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      SYNC_DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      ASYNC_DATABASE_URL: >-
+        postgresql+asyncpg://postgres:postgres@localhost:5432/efhc_test
+
+      PSYCOPG_URL: postgresql://postgres:postgres@localhost:5432/efhc_test
+
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Init artifacts
+        run: |
+          rm -rf ci_artifacts extracted
+          mkdir -p ci_artifacts
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Versions
+        run: |
+          {
+            echo "ref=$GITHUB_REF"
+            echo "sha=$GITHUB_SHA"
+            python -V
+            python -m pip -V
+            node -v
+            npm -v
+          } | tee ci_artifacts/01_versions.txt
+
+      - name: Guard DB profile
+        run: |
+          python - <<'PY' | tee ci_artifacts/02_db_guard.txt
+          import os, sys
+          url = os.environ.get("DATABASE_URL", "")
+          if not url:
+              print("ERROR: DATABASE_URL empty")
+              sys.exit(2)
+          if url.lower().startswith("sqlite://"):
+              print("ERROR: sqlite forbidden")
+              sys.exit(3)
+          print("OK: postgres-only")
+          PY
+
+      - name: Ensure efhc.zip
+        run: |
+          test -f efhc.zip || \
+            (echo "ERROR: efhc.zip missing" && exit 1)
+          ls -la efhc.zip | tee ci_artifacts/03_efhc_zip_ls.txt
+
+      - name: Development HEAD SHA-256
+        id: development_head_sha256
+        run: |
+          set -euo pipefail
+          sha_line="$(sha256sum efhc.zip)"
+          sha="${sha_line%% *}"
+
+          if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "ERROR: invalid SHA-256 for efhc.zip: $sha"
+            echo "1" > ci_artifacts/exit_development_head_sha256.txt
+            exit 1
+          fi
+
+          printf '%s  %s\n' "$sha" "efhc.zip" | \
+            tee ci_artifacts/03a_efhc_zip_sha256.txt
+
+          echo "EFHC Development HEAD SHA-256: $sha"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### EFHC Development HEAD"
+            echo
+            echo "- file: \`efhc.zip\`"
+            echo "- SHA-256: \`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "0" > ci_artifacts/exit_development_head_sha256.txt
+
+      - name: Unzip efhc.zip
+        run: |
+          mkdir -p extracted
+          unzip -q efhc.zip -d extracted
+          find extracted -maxdepth 12 -name ".npmrc" \
+            -print -delete || true
+          test -d extracted/backend || \
+            (echo "ERROR: extracted/backend missing" && exit 1)
+          test -f extracted/backend/alembic.ini || exit 1
+          test -f extracted/backend/requirements.txt || exit 1
+
+      - name: Install latest backend/test deps
+        run: |
+          python -m pip install --upgrade pip setuptools wheel packaging
+
+          test -f extracted/backend/requirements.txt || \
+            (echo "ERROR: extracted/backend/requirements.txt missing" && exit 1)
+          test -f extracted/requirements-test.txt || \
+            (echo "ERROR: extracted/requirements-test.txt missing" && exit 1)
+
+          # CI policy: test against the newest available direct Python packages.
+          # Source requirement files remain untouched inside extracted/.
+          python - <<'PY'
+          from pathlib import Path
+          from packaging.requirements import InvalidRequirement, Requirement
+
+          def write_latest_requirements(source: str, target: str) -> None:
+              output: list[str] = []
+              for line_no, raw in enumerate(
+                  Path(source).read_text(encoding="utf-8").splitlines(),
+                  start=1,
+              ):
+                  value = raw.strip()
+                  if not value or value.startswith("#"):
+                      continue
+                  if value.startswith(("-", "--")):
+                      raise SystemExit(
+                          f"Unsupported requirements directive in {source}:{line_no}: {value}"
+                      )
+                  try:
+                      req = Requirement(value)
+                  except InvalidRequirement as exc:
+                      raise SystemExit(
+                          f"Invalid requirement in {source}:{line_no}: {value}: {exc}"
+                      ) from exc
+                  if req.url is not None:
+                      raise SystemExit(
+                          f"Direct URL requirement cannot satisfy latest-policy: "
+                          f"{source}:{line_no}: {value}"
+                      )
+
+                  extras = f"[{','.join(sorted(req.extras))}]" if req.extras else ""
+                  marker = f"; {req.marker}" if req.marker else ""
+                  output.append(f"{req.name}{extras}{marker}")
+
+              if not output:
+                  raise SystemExit(f"No installable requirements found in {source}")
+              Path(target).write_text("\n".join(output) + "\n", encoding="utf-8")
+
+          write_latest_requirements(
+              "extracted/backend/requirements.txt",
+              "ci_artifacts/requirements-runtime-latest.txt",
+          )
+          write_latest_requirements(
+              "extracted/requirements-test.txt",
+              "ci_artifacts/requirements-test-latest.txt",
+          )
+          PY
+
+          python -m pip install --upgrade --upgrade-strategy eager \
+            -r ci_artifacts/requirements-runtime-latest.txt
+          python -m pip install --upgrade --upgrade-strategy eager \
+            -r ci_artifacts/requirements-test-latest.txt
+
+          python - <<'PY' | tee ci_artifacts/04_test_deps_sanity.txt
+          import alembic
+          import freezegun
+          import jwt
+          import psycopg
+          import pytest
+          import pytest_asyncio
+
+          print("OK: test dependency bootstrap")
+          print("pytest", pytest.__version__)
+          print("pytest_asyncio", pytest_asyncio.__version__)
+          print("freezegun", freezegun.__version__)
+          print("psycopg", psycopg.__version__)
+          print("alembic", alembic.__version__)
+          print("PyJWT", jwt.__version__)
+          PY
+
+          pip freeze | sort | tee ci_artifacts/04_pip_freeze.txt
+
+      - name: flake8 (critical)
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade flake8
+          cd extracted
+          flake8 backend/app tests api ops \
+            --count --show-source --statistics \
+            2>&1 | tee ../ci_artifacts/04a_flake8_critical.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_flake8_critical.txt
+          exit "$ec"
+
+      - name: flake8 (full report)
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade flake8
+          cd extracted
+          flake8 backend/app tests api ops \
+            --exit-zero --count --show-source --statistics \
+            2>&1 | tee ../ci_artifacts/04b_flake8_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_flake8_full.txt
+          exit 0
+
+      - name: ruff (full report)
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade ruff
+          cd extracted
+          ruff check backend api ops tests \
+            2>&1 | tee ../ci_artifacts/04c_ruff_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_ruff_full.txt
+          exit "$ec"
+
+      - name: mypy (full report)
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade mypy
+          cd extracted
+          mypy backend/app \
+            --cache-dir ../ci_artifacts/_mypy_cache \
+            2>&1 | tee ../ci_artifacts/04d_mypy_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_mypy_full.txt
+          rm -rf .mypy_cache || true
+          exit "$ec"
+
+      - name: bandit (full report)
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade bandit
+          cd extracted
+          bandit -r backend/app \
+            2>&1 | tee ../ci_artifacts/04e_bandit_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_bandit_full.txt
+          exit "$ec"
+
+      - name: compileall backend
+        continue-on-error: true
+        run: |
+          set +e
+          python -m compileall extracted/backend -q \
+            2>&1 | tee ci_artifacts/05_compileall.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ci_artifacts/exit_compileall.txt
+          exit "$ec"
+
+      - name: Install psql client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          psql --version | tee ci_artifacts/06_psql_version.txt
+
+      - name: PSQL diag pre
+        continue-on-error: true
+        run: |
+          set +e
+          PGPASSWORD=postgres psql \
+            -h localhost -p 5432 -U postgres -d efhc_test \
+            -v ON_ERROR_STOP=1 \
+            -c "SELECT current_database() AS db;" \
+            -c "SHOW search_path;" \
+            -c "SELECT nspname FROM pg_namespace ORDER BY 1;" \
+            -c "SELECT count(*) AS tables FROM pg_tables;" \
+            2>&1 | tee ci_artifacts/07_psql_pre.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ci_artifacts/exit_psql_pre.txt
+          exit "$ec"
+
+      - name: Alembic upgrade head
+        continue-on-error: true
+        run: |
+          set +e
+          cd extracted/backend
+          python -m alembic -c alembic.ini upgrade head \
+            2>&1 | tee ../../ci_artifacts/08_alembic_upgrade.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../../ci_artifacts/exit_alembic_upgrade.txt
+          exit "$ec"
+
+      - name: pytest -q (collect all failures)
+        continue-on-error: true
+        run: |
+          set +e
+          rm -rf extracted/.mypy_cache || true
+          cd extracted
+          # pytest по умолчанию НЕ останавливается на первом падении.
+          # Главное — не использовать -x.
+          PYTHONPATH=backend pytest -q \
+            2>&1 | tee ../ci_artifacts/12_pytest.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_pytest.txt
+          exit "$ec"
+
+      - name: Frontend build
+        continue-on-error: true
+        run: |
+          set +e
+          test -f extracted/frontend/package-lock.json || exit 1
+
+          if grep -RInE \
+            "applied-caas-gateway|internal\.api\.openai|artifactory" \
+            extracted/frontend/package-lock.json; then
+            echo "ERROR: forbidden registry markers"
+            exit 1
+          fi
+
+          cd extracted/frontend
+          npm config set registry https://registry.npmjs.org/
+
+          # CI policy: test against newest direct npm dependencies.
+          # package-lock.json is intentionally ignored for this compatibility run.
+          cp package.json ../../ci_artifacts/13_package_json_original.json
+          node - <<'NODE'
+          const fs = require("fs");
+          const path = "package.json";
+          const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+
+          for (const group of [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+          ]) {
+            if (!pkg[group]) continue;
+            for (const name of Object.keys(pkg[group])) {
+              pkg[group][name] = "latest";
+            }
+          }
+
+          // Preserve $-references in overrides; remove explicit version ceilings
+          // so they do not silently pin a transitive dependency to an old range.
+          function relaxOverrides(value) {
+            if (typeof value === "string") {
+              return value.startsWith("$") ? value : "latest";
+            }
+            if (value && typeof value === "object" && !Array.isArray(value)) {
+              for (const key of Object.keys(value)) {
+                value[key] = relaxOverrides(value[key]);
+              }
+            }
+            return value;
+          }
+          if (pkg.overrides) pkg.overrides = relaxOverrides(pkg.overrides);
+
+          fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
+          NODE
+
+          rm -rf node_modules
+          npm install --package-lock=false --include=dev \
+            --no-audit --no-fund --progress=false \
+            2>&1 | tee ../../ci_artifacts/13_npm_install_latest.txt
+          ec_ci=${PIPESTATUS[0]}
+          echo "$ec_ci" > ../../ci_artifacts/exit_npm_install_latest.txt
+
+          npm ls --depth=0 \
+            2>&1 | tee ../../ci_artifacts/13_npm_versions.txt || true
+
+          npm run build 2>&1 | tee ../../ci_artifacts/14_npm_build.txt
+          ec_build=${PIPESTATUS[0]}
+          echo "$ec_build" > ../../ci_artifacts/exit_npm_build.txt
+
+          if test "$ec_ci" != "0"; then
+            exit "$ec_ci"
+          fi
+          exit "$ec_build"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci_artifacts
+          path: ci_artifacts
+          retention-days: 14
+
+      - name: Gate summary
+        run: |
+          failed=0
+          for f in ci_artifacts/exit_*.txt; do
+            if test -f "$f"; then
+              v="$(cat "$f" || true)"
+              if test "$v" != "0"; then
+                echo "FAIL: $f exit=$v"
+                failed=1
+              else
+                echo "OK:   $f exit=$v"
+              fi
+            else
+              echo "MISS: $f"
+              failed=1
+            fi
+          done
+
+          if test "$failed" = "1"; then
+            echo "ERROR: one or more gate steps failed."
+            exit 1
+          fi
+
+          echo "OK: all gate steps passed."
