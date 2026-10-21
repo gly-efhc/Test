@@ -1,0 +1,815 @@
+name: EFHC FULL Archive CI
+
+# GitHub UI upload/replacement of efhc.zip produces a push touching this path.
+# The archive remains immutable throughout qualification.
+on:
+  push:
+    paths:
+      - efhc.zip
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+jobs:
+  canon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      diagnostics_uploaded: ${{ steps.upload_diagnostics.outcome }}
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: efhc_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d efhc_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+
+    env:
+      DB_SCHEMA_CORE: efhc_core
+      DB_SCHEMA_ADMIN: efhc_admin
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: efhc_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      # Do not create Python bytecode inside an otherwise pristine source tree.
+      PYTHONDONTWRITEBYTECODE: "1"
+
+      DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      SYNC_DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      ASYNC_DATABASE_URL: >-
+        postgresql+asyncpg://postgres:postgres@localhost:5432/efhc_test
+
+      PSYCOPG_URL: postgresql://postgres:postgres@localhost:5432/efhc_test
+
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Init artifacts
+        run: |
+          rm -rf ci_artifacts extracted
+          mkdir -p ci_artifacts
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Versions
+        run: |
+          {
+            echo "ref=$GITHUB_REF"
+            echo "sha=$GITHUB_SHA"
+            python -V
+            python -m pip -V
+            node -v
+            npm -v
+          } | tee ci_artifacts/01_versions.txt
+
+      - name: Guard DB profile
+        run: |
+          python - <<'PY' | tee ci_artifacts/02_db_guard.txt
+          import os, sys
+          url = os.environ.get("DATABASE_URL", "")
+          if not url:
+              print("ERROR: DATABASE_URL empty")
+              sys.exit(2)
+          if url.lower().startswith("sqlite://"):
+              print("ERROR: sqlite forbidden")
+              sys.exit(3)
+          print("OK: postgres-only")
+          PY
+
+      - name: Ensure efhc.zip
+        id: ensure_zip
+        run: |
+          if test ! -f efhc.zip; then
+            echo "ERROR: efhc.zip missing" | tee ci_artifacts/03_efhc_zip_ls.txt
+            echo 1 > ci_artifacts/exit_ensure_zip.txt
+            exit 1
+          fi
+          ls -la efhc.zip | tee ci_artifacts/03_efhc_zip_ls.txt
+          echo 0 > ci_artifacts/exit_ensure_zip.txt
+
+      - name: Development HEAD SHA-256
+        id: development_head_sha256
+        run: |
+          set -euo pipefail
+          sha_line="$(sha256sum efhc.zip)"
+          sha="${sha_line%% *}"
+
+          if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "ERROR: invalid SHA-256 for efhc.zip: $sha"
+            echo "1" > ci_artifacts/exit_development_head_sha256.txt
+            exit 1
+          fi
+
+          printf '%s  %s\n' "$sha" "efhc.zip" | \
+            tee ci_artifacts/03a_efhc_zip_sha256.txt
+
+          echo "EFHC Development HEAD SHA-256: $sha"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### EFHC Development HEAD"
+            echo
+            echo "- file: \`efhc.zip\`"
+            echo "- SHA-256: \`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "0" > ci_artifacts/exit_development_head_sha256.txt
+
+      - name: Unzip efhc.zip
+        id: unzip_archive
+        run: |
+          set +e
+          # Validate all archive entries BEFORE extraction. Reject links and traversal.
+          python - <<'PY' 2>&1 | tee ci_artifacts/03b_zip_validation.txt
+          import re
+          import stat
+          import sys
+          import zipfile
+          from pathlib import PurePosixPath
+
+          with zipfile.ZipFile('efhc.zip') as zf:
+              seen = set()
+              files = 0
+              total_bytes = 0
+              for entry in zf.infolist():
+                  name = entry.filename
+                  path = PurePosixPath(name)
+                  mode = entry.external_attr >> 16
+                  if (not name or '\\' in name or name.startswith('/')
+                          or any(part in ('..', '') for part in path.parts)
+                          or re.match(r'^[A-Za-z]:', name)
+                          or any(ord(c) < 32 for c in name)
+                          or stat.S_ISLNK(mode)):
+                      raise SystemExit(f'UNSAFE archive entry: {name!r}')
+                  canonical = str(path).rstrip('/')
+                  if canonical in seen:
+                      raise SystemExit(f'DUPLICATE archive entry: {name!r}')
+                  seen.add(canonical)
+                  if not entry.is_dir():
+                      files += 1
+                      total_bytes += entry.file_size
+                  if len(seen) > 100000 or total_bytes > 8 * 1024**3:
+                      raise SystemExit('Archive exceeds safety limits')
+              if not files:
+                  raise SystemExit('Archive contains no files')
+              failed = zf.testzip()
+              if failed:
+                  raise SystemExit(f'CRC error in ZIP entry: {failed}')
+              print(f'ZIP_VALID=PASS entries={len(seen)} total_uncompressed={total_bytes}')
+          PY
+          rc=${PIPESTATUS[0]}
+          if test "$rc" != 0; then
+            echo "$rc" > ci_artifacts/exit_unzip_archive.txt
+            exit "$rc"
+          fi
+          mkdir -p extracted
+          unzip -q efhc.zip -d extracted
+          unzip_rc=$?
+          if test "$unzip_rc" != 0; then
+            echo "$unzip_rc" > ci_artifacts/exit_unzip_archive.txt
+            exit "$unzip_rc"
+          fi
+          # User-supplied npm registry overrides are not trusted in the test runner.
+          find extracted -maxdepth 12 -name ".npmrc" -type f -print -delete || true
+          for required in \
+            backend/alembic.ini backend/requirements.txt \
+            requirements-test.txt frontend/package.json frontend/package-lock.json; do
+            if test ! -f "extracted/$required"; then
+              echo "ERROR: extracted/$required missing" | tee -a ci_artifacts/03b_zip_validation.txt
+              echo 1 > ci_artifacts/exit_unzip_archive.txt
+              exit 1
+            fi
+          done
+          # Scope validation must run against the pristine extracted ZIP,
+          # BEFORE pip, pytest, or npm create .pytest_cache/node_modules/.next.
+          python extracted/ops/release/check_frontend_archive_scope.py \
+            --root extracted 2>&1 | tee ci_artifacts/03c_archive_scope.txt
+          scope_rc=${PIPESTATUS[0]}
+          echo "$scope_rc" > ci_artifacts/exit_archive_scope.txt
+          if test "$scope_rc" != 0; then
+            echo "$scope_rc" > ci_artifacts/exit_unzip_archive.txt
+            exit "$scope_rc"
+          fi
+          echo 0 > ci_artifacts/exit_unzip_archive.txt
+
+      - name: Install latest backend/test deps
+        id: backend_deps
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip setuptools wheel packaging
+
+          test -f extracted/backend/requirements.txt || \
+            (echo "ERROR: extracted/backend/requirements.txt missing" && exit 1)
+          test -f extracted/requirements-test.txt || \
+            (echo "ERROR: extracted/requirements-test.txt missing" && exit 1)
+
+          # CI policy: test against the newest available direct Python packages.
+          # Source requirement files remain untouched inside extracted/.
+          python - <<'PY'
+          from pathlib import Path
+          from packaging.requirements import InvalidRequirement, Requirement
+
+          def write_latest_requirements(source: str, target: str) -> None:
+              output: list[str] = []
+              for line_no, raw in enumerate(
+                  Path(source).read_text(encoding="utf-8").splitlines(),
+                  start=1,
+              ):
+                  value = raw.strip()
+                  if not value or value.startswith("#"):
+                      continue
+                  if value.startswith(("-", "--")):
+                      raise SystemExit(
+                          f"Unsupported requirements directive in {source}:{line_no}: {value}"
+                      )
+                  try:
+                      req = Requirement(value)
+                  except InvalidRequirement as exc:
+                      raise SystemExit(
+                          f"Invalid requirement in {source}:{line_no}: {value}: {exc}"
+                      ) from exc
+                  if req.url is not None:
+                      raise SystemExit(
+                          f"Direct URL requirement cannot satisfy latest-policy: "
+                          f"{source}:{line_no}: {value}"
+                      )
+
+                  extras = f"[{','.join(sorted(req.extras))}]" if req.extras else ""
+                  marker = f"; {req.marker}" if req.marker else ""
+                  output.append(f"{req.name}{extras}{marker}")
+
+              if not output:
+                  raise SystemExit(f"No installable requirements found in {source}")
+              Path(target).write_text("\n".join(output) + "\n", encoding="utf-8")
+
+          write_latest_requirements(
+              "extracted/backend/requirements.txt",
+              "ci_artifacts/requirements-runtime-latest.txt",
+          )
+          write_latest_requirements(
+              "extracted/requirements-test.txt",
+              "ci_artifacts/requirements-test-latest.txt",
+          )
+          PY
+
+          python -m pip install --upgrade --upgrade-strategy eager \
+            -r ci_artifacts/requirements-runtime-latest.txt
+          python -m pip install --upgrade --upgrade-strategy eager \
+            -r ci_artifacts/requirements-test-latest.txt
+
+          python - <<'PY' | tee ci_artifacts/04_test_deps_sanity.txt
+          import alembic
+          import freezegun
+          import jwt
+          import psycopg
+          import pytest
+          import pytest_asyncio
+
+          print("OK: test dependency bootstrap")
+          print("pytest", pytest.__version__)
+          print("pytest_asyncio", pytest_asyncio.__version__)
+          print("freezegun", freezegun.__version__)
+          print("psycopg", psycopg.__version__)
+          print("alembic", alembic.__version__)
+          print("PyJWT", jwt.__version__)
+          PY
+
+          pip freeze | sort | tee ci_artifacts/04_pip_freeze.txt
+
+      - name: flake8 (critical)
+        id: flake8_critical
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade flake8
+          cd extracted
+          flake8 backend/app tests api ops \
+            --count --show-source --statistics \
+            2>&1 | tee ../ci_artifacts/04a_flake8_critical.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_flake8_critical.txt
+          exit "$ec"
+
+      - name: flake8 (full report)
+        id: flake8_full
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade flake8
+          cd extracted
+          flake8 backend/app tests api ops \
+            --exit-zero --count --show-source --statistics \
+            2>&1 | tee ../ci_artifacts/04b_flake8_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_flake8_full.txt
+          exit 0
+
+      - name: ruff (full report)
+        id: ruff
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade ruff
+          cd extracted
+          ruff check backend api ops tests \
+            2>&1 | tee ../ci_artifacts/04c_ruff_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_ruff_full.txt
+          exit "$ec"
+
+      - name: mypy (full report)
+        id: mypy
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade mypy
+          cd extracted
+          mypy backend/app \
+            --cache-dir ../ci_artifacts/_mypy_cache \
+            2>&1 | tee ../ci_artifacts/04d_mypy_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_mypy_full.txt
+          rm -rf .mypy_cache || true
+          exit "$ec"
+
+      - name: bandit (full report)
+        id: bandit
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade bandit
+          cd extracted
+          bandit -r backend/app \
+            2>&1 | tee ../ci_artifacts/04e_bandit_full.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_bandit_full.txt
+          exit "$ec"
+
+      - name: compileall backend
+        id: compileall
+        continue-on-error: true
+        run: |
+          set +e
+          python -m compileall extracted/backend -q \
+            2>&1 | tee ci_artifacts/05_compileall.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ci_artifacts/exit_compileall.txt
+          exit "$ec"
+
+      - name: Install psql client
+        id: psql_client
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          psql --version | tee ci_artifacts/06_psql_version.txt
+
+      - name: PSQL diag pre
+        id: psql_diag
+        continue-on-error: true
+        run: |
+          set +e
+          PGPASSWORD=postgres psql \
+            -h localhost -p 5432 -U postgres -d efhc_test \
+            -v ON_ERROR_STOP=1 \
+            -c "SELECT current_database() AS db;" \
+            -c "SHOW search_path;" \
+            -c "SELECT nspname FROM pg_namespace ORDER BY 1;" \
+            -c "SELECT count(*) AS tables FROM pg_tables;" \
+            2>&1 | tee ci_artifacts/07_psql_pre.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ci_artifacts/exit_psql_pre.txt
+          exit "$ec"
+
+      - name: Alembic upgrade head
+        id: alembic
+        continue-on-error: true
+        run: |
+          set +e
+          cd extracted/backend
+          python -m alembic -c alembic.ini upgrade head \
+            2>&1 | tee ../../ci_artifacts/08_alembic_upgrade.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../../ci_artifacts/exit_alembic_upgrade.txt
+          exit "$ec"
+
+      - name: Frontend build
+        id: frontend_latest_build
+        continue-on-error: true
+        run: |
+          set +e
+          if test ! -f extracted/frontend/package-lock.json; then
+            echo 'ERROR: frontend/package-lock.json missing' | tee ci_artifacts/13_frontend_preflight.txt
+            echo 1 > ci_artifacts/exit_npm_build.txt
+            exit 1
+          fi
+
+          if grep -RInE \
+            "applied-caas-gateway|internal\.api\.openai|artifactory" \
+            extracted/frontend/package-lock.json; then
+            echo "ERROR: forbidden registry markers" | tee ci_artifacts/13_frontend_preflight.txt
+            echo 1 > ci_artifacts/exit_npm_build.txt
+            exit 1
+          fi
+
+          cd extracted/frontend
+          npm config set registry https://registry.npmjs.org/
+
+          # CI policy: test against newest direct npm dependencies.
+          # package-lock.json is intentionally ignored for this compatibility run.
+          cp package.json ../../ci_artifacts/13_package_json_original.json
+          node - <<'NODE'
+          const fs = require("fs");
+          const path = "package.json";
+          const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+
+          for (const group of [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+          ]) {
+            if (!pkg[group]) continue;
+            for (const name of Object.keys(pkg[group])) {
+              pkg[group][name] = "latest";
+            }
+          }
+
+          // Preserve $-references in overrides; remove explicit version ceilings
+          // so they do not silently pin a transitive dependency to an old range.
+          function relaxOverrides(value) {
+            if (typeof value === "string") {
+              return value.startsWith("$") ? value : "latest";
+            }
+            if (value && typeof value === "object" && !Array.isArray(value)) {
+              for (const key of Object.keys(value)) {
+                value[key] = relaxOverrides(value[key]);
+              }
+            }
+            return value;
+          }
+          if (pkg.overrides) pkg.overrides = relaxOverrides(pkg.overrides);
+
+          fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
+          NODE
+
+          rm -rf node_modules
+          npm install --package-lock=false --include=dev \
+            --no-audit --no-fund --progress=false \
+            2>&1 | tee ../../ci_artifacts/13_npm_install_latest.txt
+          ec_ci=${PIPESTATUS[0]}
+          echo "$ec_ci" > ../../ci_artifacts/exit_npm_install_latest.txt
+
+          npm ls --depth=0 \
+            2>&1 | tee ../../ci_artifacts/13_npm_versions.txt || true
+
+          npm run build 2>&1 | tee ../../ci_artifacts/14_npm_build.txt
+          ec_build=${PIPESTATUS[0]}
+          echo "$ec_build" > ../../ci_artifacts/exit_npm_build.txt
+
+          if test "$ec_ci" != "0"; then
+            exit "$ec_ci"
+          fi
+          exit "$ec_build"
+
+      - name: Frontend canonical lockfile qualification
+        id: frontend_canonical
+        continue-on-error: true
+        run: |
+          set +e
+          cd extracted/frontend
+          # Restore the exact package.json from efhc.zip after the latest-package
+          # compatibility test; work only in extracted/, never in efhc.zip.
+          cp ../../ci_artifacts/13_package_json_original.json package.json
+          rm -rf node_modules
+          npm ci --no-audit --no-fund --progress=false \
+            2>&1 | tee ../../ci_artifacts/15_npm_ci.txt
+          install_rc=${PIPESTATUS[0]}
+          echo "$install_rc" > ../../ci_artifacts/exit_npm_ci.txt
+          if test "$install_rc" != 0; then
+            echo 'BLOCKED: canonical build and checks require npm ci' | tee ../../ci_artifacts/15_frontend_blocked.txt
+            exit "$install_rc"
+          fi
+          failed=0
+          for phase in typecheck build check:frontend-regression performance-budgets release-assets:verify; do
+            safe="${phase//[:\/-]/_}"
+            npm run "$phase" 2>&1 | tee "../../ci_artifacts/15_${safe}.txt"
+            rc=${PIPESTATUS[0]}
+            echo "$rc" > "../../ci_artifacts/exit_frontend_${safe}.txt"
+            if test "$rc" != 0; then failed=1; fi
+          done
+          exit "$failed"
+
+      - name: pytest -q (collect all failures)
+        id: pytest
+        continue-on-error: true
+        run: |
+          set +e
+          rm -rf extracted/.mypy_cache || true
+          cd extracted
+          # pytest по умолчанию НЕ останавливается на первом падении.
+          # Главное — не использовать -x.
+          PYTHONPATH=backend pytest -q -p no:cacheprovider \
+            --junitxml=../ci_artifacts/12_pytest.xml \
+            2>&1 | tee ../ci_artifacts/12_pytest.txt
+          ec=${PIPESTATUS[0]}
+          echo "$ec" > ../ci_artifacts/exit_pytest.txt
+          exit "$ec"
+
+      - name: Security dependency audits
+        id: dependency_audits
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --upgrade pip-audit \
+            2>&1 | tee ci_artifacts/16_pip_audit_install.txt
+          install_rc=${PIPESTATUS[0]}
+          echo "$install_rc" > ci_artifacts/exit_pip_audit_install.txt
+          failed=0
+          if test "$install_rc" = 0; then
+            pip-audit --disable-pip --no-deps -r ci_artifacts/04_pip_freeze.txt \
+              2>&1 | tee ci_artifacts/16_pip_audit.txt
+            rc=${PIPESTATUS[0]}
+            echo "$rc" > ci_artifacts/exit_pip_audit.txt
+            if test "$rc" != 0; then failed=1; fi
+          else
+            failed=1
+          fi
+          if test -d extracted/frontend/node_modules; then
+            cd extracted/frontend
+            npm audit --audit-level=high \
+              2>&1 | tee ../../ci_artifacts/16_npm_audit.txt
+            rc=${PIPESTATUS[0]}
+            echo "$rc" > ../../ci_artifacts/exit_npm_audit.txt
+            if test "$rc" != 0; then failed=1; fi
+          else
+            echo 'BLOCKED: npm dependencies not installed' | tee ci_artifacts/16_npm_audit.txt
+            failed=1
+          fi
+          exit "$failed"
+
+      - name: Release, API and report integrity
+        id: release_contracts
+        continue-on-error: true
+        run: |
+          set +e
+          cd extracted
+          failed=0
+          # Run independent checks separately, retaining each exact exit code.
+          commands=(
+            'python scripts/ci/check_test_authority.py'
+            'python scripts/ci/check_test_suite_integrity.py'
+            'PYTHONPATH=backend python -m app.release.database_validation'
+            'python ops/ci_checks/check_workflow_parity.py'
+            'python ops/local/check_frontend_routes.py'
+            'python ops/reports/check_numbered_reports.py'
+            'python ops/reports/check_frontend_reports_scope.py --root .'
+            'python ops/ci_checks/check_frontend_cycle_numbering.py --root .'
+            'python ops/release/prepare_frontend_release_assets.py --root . --version "$(cat VERSION)" --verify-only'
+          )
+          n=0
+          for cmd in "${commands[@]}"; do
+            n=$((n+1))
+            echo "COMMAND: $cmd" | tee "../ci_artifacts/17_contract_${n}.txt"
+            bash -c "$cmd" 2>&1 | tee -a "../ci_artifacts/17_contract_${n}.txt"
+            rc=${PIPESTATUS[0]}
+            echo "$rc" > "../ci_artifacts/exit_contract_${n}.txt"
+            if test "$rc" != 0; then failed=1; fi
+          done
+          exit "$failed"
+
+      - name: Full Chromium browser E2E
+        id: browser_e2e
+        continue-on-error: true
+        env:
+          EFHC_RUN_E2E: '1'
+          EFHC_E2E_BASE_URL: http://127.0.0.1:3002
+          EFHC_E2E_ADMIN_PROOF: '1'
+          API_PREFIX: /api
+          APP_ENV: test
+          ENVIRONMENT: test
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: |
+          set +e
+          python -m pip install 'playwright==1.63.0' \
+            2>&1 | tee ci_artifacts/18_playwright_install.txt
+          dep_rc=${PIPESTATUS[0]}
+          if test "$dep_rc" = 0; then
+            python -m playwright install --with-deps chromium \
+              2>&1 | tee ci_artifacts/18_chromium_install.txt
+            dep_rc=${PIPESTATUS[0]}
+          fi
+          echo "$dep_rc" > ci_artifacts/exit_browser_dependencies.txt
+          if test "$dep_rc" != 0; then
+            echo 'BLOCKED: Chromium/Playwright installation failed' | tee ci_artifacts/18_browser_e2e.txt
+            exit "$dep_rc"
+          fi
+          # All browser tests use a fresh mock-capable Next build, like
+          # the existing EFHC FULL qualification workflow.
+          cd extracted/frontend
+          NEXT_PUBLIC_EFHC_E2E_TONCONNECT_MOCK=1 npm run build \
+            2>&1 | tee ../../ci_artifacts/18_browser_build.txt
+          build_rc=${PIPESTATUS[0]}
+          echo "$build_rc" > ../../ci_artifacts/exit_browser_build.txt
+          if test "$build_rc" != 0; then exit "$build_rc"; fi
+          cd ..
+          node frontend/node_modules/next/dist/bin/next start frontend -p 3002 \
+            > ../ci_artifacts/18_browser_server.txt 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          python - <<'PY' 2>&1 | tee ../ci_artifacts/18_server_readiness.txt
+          import time
+          from urllib.request import urlopen
+          for attempt in range(90):
+              try:
+                  with urlopen('http://127.0.0.1:3002', timeout=2) as response:
+                      if response.status == 200:
+                          print('Server ready')
+                          break
+              except Exception:
+                  time.sleep(1)
+          else:
+              raise SystemExit('Browser server readiness failed')
+          PY
+          ready_rc=${PIPESTATUS[0]}
+          if test "$ready_rc" != 0; then
+            echo "$ready_rc" > ../ci_artifacts/exit_browser_e2e.txt
+            exit "$ready_rc"
+          fi
+          export EFHC_TEST_ARTIFACT_DIR="$PWD/../ci_artifacts/browser_evidence"
+          mkdir -p "$EFHC_TEST_ARTIFACT_DIR"
+          PYTHONPATH=backend pytest -q -p no:cacheprovider tests/frontend/e2e \
+            --junitxml=../ci_artifacts/18_browser_e2e.xml \
+            2>&1 | tee ../ci_artifacts/18_browser_e2e.txt
+          rc=${PIPESTATUS[0]}
+          # Do not accept skipped tests as an E2E PASS.
+          python - <<'PY' 2>&1 | tee ../ci_artifacts/18_browser_xml_check.txt
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          f = Path('../ci_artifacts/18_browser_e2e.xml')
+          if not f.is_file():
+              raise SystemExit('Browser JUnit XML missing')
+          root = ET.parse(f).getroot()
+          cases = list(root.iter('testcase'))
+          skipped = sum(c.find('skipped') is not None for c in cases)
+          failed = sum(c.find('failure') is not None or c.find('error') is not None for c in cases)
+          print(f'browser_cases={len(cases)} skipped={skipped} failures={failed}')
+          if not cases or skipped or failed:
+              raise SystemExit('Browser E2E evidence incomplete or failing')
+          PY
+          xml_rc=${PIPESTATUS[0]}
+          if test "$xml_rc" != 0; then rc="$xml_rc"; fi
+          echo "$rc" > ../ci_artifacts/exit_browser_e2e.txt
+          exit "$rc"
+
+      - name: Final gate summary
+        id: final_gate
+        if: always()
+        env:
+          ENSURE_ZIP: ${{ steps.ensure_zip.outcome }}
+          UNZIP_ARCHIVE: ${{ steps.unzip_archive.outcome }}
+          BACKEND_DEPS: ${{ steps.backend_deps.outcome }}
+          FLAKE8_CRITICAL: ${{ steps.flake8_critical.outcome }}
+          FLAKE8_FULL_REPORT: ${{ steps.flake8_full.outcome }}
+          RUFF: ${{ steps.ruff.outcome }}
+          MYPY: ${{ steps.mypy.outcome }}
+          BANDIT: ${{ steps.bandit.outcome }}
+          COMPILEALL: ${{ steps.compileall.outcome }}
+          PSQL_CLIENT: ${{ steps.psql_client.outcome }}
+          PSQL_DIAG: ${{ steps.psql_diag.outcome }}
+          ALEMBIC: ${{ steps.alembic.outcome }}
+          PYTEST: ${{ steps.pytest.outcome }}
+          FRONTEND_LATEST_BUILD: ${{ steps.frontend_latest_build.outcome }}
+          FRONTEND_CANONICAL: ${{ steps.frontend_canonical.outcome }}
+          DEPENDENCY_AUDITS: ${{ steps.dependency_audits.outcome }}
+          RELEASE_CONTRACTS: ${{ steps.release_contracts.outcome }}
+          BROWSER_E2E: ${{ steps.browser_e2e.outcome }}
+        run: |
+          failed=0
+          mkdir -p ci_artifacts
+          if test -f efhc.zip; then
+            archive_sha="$(sha256sum efhc.zip | awk '{print $1}')"
+          else
+            archive_sha=MISSING
+          fi
+          {
+            echo "ref=$GITHUB_REF"
+            echo "sha=$GITHUB_SHA"
+            echo "zip_sha256=$archive_sha"
+          } > ci_artifacts/99_run_identity.txt
+          : > ci_artifacts/99_step_outcomes.txt
+          for name in ENSURE_ZIP UNZIP_ARCHIVE BACKEND_DEPS FLAKE8_CRITICAL \
+            RUFF MYPY BANDIT COMPILEALL PSQL_CLIENT PSQL_DIAG ALEMBIC \
+            PYTEST FRONTEND_LATEST_BUILD FRONTEND_CANONICAL \
+            DEPENDENCY_AUDITS RELEASE_CONTRACTS BROWSER_E2E; do
+            value="${!name:-skipped}"
+            printf '%-27s %s\n' "$name" "$value" | tee -a ci_artifacts/99_step_outcomes.txt
+            if test "$value" != success; then failed=1; fi
+          done
+          # The second flake8 pass intentionally emits informational findings.
+          echo "FLAKE8_FULL_REPORT=${FLAKE8_FULL_REPORT:-skipped}" \
+            | tee -a ci_artifacts/99_step_outcomes.txt
+          shopt -s nullglob
+          for f in ci_artifacts/exit_*.txt; do
+            rc="$(cat "$f" 2>/dev/null || echo missing)"
+            if test "$rc" != 0; then
+              echo "FAIL: $f exit=$rc" | tee -a ci_artifacts/99_step_outcomes.txt
+              failed=1
+            fi
+          done
+          if test "$failed" != 0; then
+            echo 'FULL ARCHIVE CI: FAIL/BLOCKED (inspect ci_artifacts)' \
+              | tee ci_artifacts/99_gate_status.txt
+            cat ci_artifacts/99_gate_status.txt >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'FULL ARCHIVE CI: PASS' | tee ci_artifacts/99_gate_status.txt
+          cat ci_artifacts/99_gate_status.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts (including failures)
+        id: upload_diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci_artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  cleanup_uploaded_archive:
+    name: Remove examined efhc.zip
+    needs: canon
+    # Delete only after diagnostics were safely uploaded, even if tests failed.
+    # On runner/setup/artifact failure retain efhc.zip as recovery input.
+    if: ${{ always() && needs.canon.outputs.diagnostics_uploaded == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_type == 'branch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Delete only the examined efhc.zip (never a subsequent upload)
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const path = 'efhc.zip';
+            const branch = context.ref.replace(/^refs\/heads\//, '');
+            const get = async (ref) => {
+              try {
+                const {data} = await github.rest.repos.getContent({owner, repo, path, ref});
+                if (Array.isArray(data) || !data.sha || data.type !== 'file')
+                  throw new Error('efhc.zip is not a regular file');
+                return data;
+              } catch (error) {
+                if (error.status === 404) return null;
+                throw error;
+              }
+            };
+            const examined = await get(context.sha);
+            if (!examined) {
+              core.notice('No efhc.zip in examined commit; nothing to delete');
+              return;
+            }
+            const current = await get(branch);
+            if (!current) {
+              core.notice('efhc.zip was already removed');
+              return;
+            }
+            if (current.sha !== examined.sha) {
+              core.warning('A newer/different efhc.zip exists: refusing to delete it');
+              return;
+            }
+            const result = await github.rest.repos.deleteFile({
+              owner, repo, path,
+              sha: current.sha,
+              branch,
+              message: 'ci: remove examined efhc.zip [skip ci]',
+            });
+            core.notice(`Removed efhc.zip after CI qualification (commit ${result.data.commit.sha})`);
